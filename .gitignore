@@ -332,3 +332,11 @@ ASALocalRun/
 
 # Local History for Visual Studio
 .localhistory/
+
+####################
+###Custom ignores###
+####################
+
+# Rubbish from building
+*.o
+test_exec
