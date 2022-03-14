@@ -13,7 +13,6 @@ template<typename Container>
 class InheritedContainer
 {
     Container my_container;
-public:
     InheritedContainer* parent;
     InheritedContainer* child;
 
@@ -80,11 +79,50 @@ public:
         }
         Iterator& operator++() { return this->operator++(0);}
     };
+
+    //These awkward, private versions of set_parent/child exist to break the recursion of the parent and child updating each other.
+    void new_child_event(InheritedContainer* new_son)
+    {
+#ifdef DEBUG
+        if(child) [[unlikely]]
+        {
+            std::cout << "WARNING: Overwrote existing child relationship of InheritedContainer!\n";
+        }
+#endif
+        child = new_son;
+    }
+    void new_parent_event(InheritedContainer* new_dad)
+    {
+#ifdef DEBUG
+        if(parent) [[unlikely]]
+        {
+            std::cout << "WARNING: Overwrote existing child relationship of InheritedContainer!\n";
+        }
+#endif
+        parent = new_dad;
+    }
 public:
     Container& container() { return my_container; }
     Iterator begin() { return Iterator(my_container,parent);}
     const Iterator end() { return Iterator(my_container);}
+    void set_parent(InheritedContainer& new_dad)
+    {
+        parent = &new_dad;
+        new_dad.new_child_event(this);
+    }
+    void set_child(InheritedContainer& new_child)
+    {
+        child = &new_child;
+        new_child.new_parent_event(this);
+    }
+    
 
+    InheritedContainer(Container&& cont, InheritedContainer& daddy)
+    :my_container(cont)
+    ,parent(&daddy)
+    ,child(nullptr)
+    {
+    }
     InheritedContainer(Container&& cont)
     :my_container(cont)
     ,parent(nullptr)
