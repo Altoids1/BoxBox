@@ -164,13 +164,41 @@ class HashTable
     size_t used_bucket_count; // The number of used buckets.
     struct CollisionData
     {
-        Bucket* begin; // Where the collision-reserved memory begins.
         size_t capacity; // Capacity of the collision memory.
+        Bucket* begin; // Where the collision-reserved memory begins.
         size_t next; // The next slot in collision memory available for link use.
-        std::queue<size_t> known_holes; // Known holes behind $next that should be filled before $next's hole.
-        CollisionData(Bucket* block, size_t total)
+        std::queue<Bucket*> known_holes; // Known holes behind $next that should be filled before $next's hole.
+        CollisionData(Bucket* b, size_t total)
+            :capacity((total * collision_block_percent / 100) ?: 1) // ELVIS OPERATOR WARNING
+            ,begin(b + (total - capacity))
+            ,next(0)
         {
 
+        }
+        Bucket* allocate_collision_bucket()
+        {
+            if(!known_holes.empty())
+            {
+                Bucket* ptr = known_holes.front();
+#ifdef DEBUG
+                if(ptr < begin || ptr > begin + capacity) [[unlikely]]
+                {
+                    throw;
+                }
+#endif
+                known_holes.pop();
+                return ptr;
+            }
+            //FIXME: Maybe we should keep a pointer to the next empty bucket in collision memory?
+            for(/*next*/; next < capacity; ++next)
+            {
+                Bucket* ptr = begin + next;
+                if(!ptr->used) [[likely]]
+                {
+                    return ptr;
+                }
+            }
+            return nullptr;
         }
     } collision_data;
     Bucket* collision_block_begin; 
@@ -178,24 +206,14 @@ class HashTable
     std::hash<Key> hasher;
 
 
-    Bucket* allocate_collision_bucket()
-    {
-        //FIXME: Maybe we should keep a pointer to the next empty bucket in collision memory?
-        for(Bucket* ptr = collision_block_begin; ptr < bucket_block + total_capacity; ++ptr)
-        {
-            if(!ptr->used)
-            {
-                return ptr;
-            }
-        }
-        return nullptr;
-    }
+    
 
     //FIXME: It's somewhat problematic that we iterate over *all* old buckets during a rehash.
     void rehash(size_t new_capacity)
     {
         Bucket* new_block = new Bucket[new_capacity];
-        size_t new_main_capacity = new_capacity - ((new_capacity * collision_block_percent / 100) ?: 1); // ELVIS OPERATOR WARNING
+        CollisionData new_collision_data = CollisionData(new_block,new_capacity);
+        size_t new_main_capacity = new_capacity - new_collision_data.capacity;
 
         for(size_t i = 0; i < total_capacity; ++i)
         {
@@ -211,7 +229,7 @@ class HashTable
                 new_buck = std::move(old_buck);
                 continue;
             }
-            Bucket* shit = allocate_collision_bucket();
+            Bucket* shit = new_collision_data.allocate_collision_bucket();
             if(!shit) [[unlikely]] // SHIT!!!
             {
                 delete[] new_block;
@@ -224,8 +242,7 @@ class HashTable
         bucket_block = new_block;
         total_capacity = new_capacity;
         main_capacity = new_main_capacity;
-        collision_block_begin = bucket_block + main_capacity;
-        collision_capacity = total_capacity - main_capacity;
+        collision_data = new_collision_data;
     }
     //Takes in a key and returns its associated bucket.
     //Generic version of at() for internal use.
@@ -252,16 +269,21 @@ class HashTable
         return nullptr;
     }
 public:
+    //Basic helpers
     [[nodiscard]] size_t capacity() const { return total_capacity;}
     [[nodiscard]] size_t size() const { return used_bucket_count;}
     bool contains(const Key& key) const { return at_bucket(key) != nullptr;}
     size_t count(const Key& key) const { return contains(key);}
+
+    //Capacity & memory API
     inline void clear() { *this = HashTable();}
     void ensure_capacity(size_t new_capacity)
     {
         if(new_capacity > total_capacity)
             rehash(new_capacity);
     }
+
+    //Iterators
     Iterator begin()
     {
         return Iterator(bucket_block,main_capacity);
@@ -305,8 +327,7 @@ public:
     ,total_capacity(4)
     ,main_capacity(3)
     ,used_bucket_count(0)
-    ,collision_block_begin(bucket_block + 3)
-    ,collision_capacity(1)
+    ,collision_data(bucket_block,total_capacity)
     {
 
     }
@@ -351,7 +372,7 @@ public:
                 Bucket* linked_buck = buck->next_collision_bucket;
                 if(!linked_buck) // End of the line!
                 {
-                    fav_buck = allocate_collision_bucket(); // Make a new bucket just for us
+                    fav_buck = collision_data.allocate_collision_bucket(); // Make a new bucket just for us
                     if(!fav_buck) // If we've run out of collision space
                     {
                         rehash(total_capacity * 2); // Just rehash
@@ -399,6 +420,7 @@ public:
         {
             if(buck->next_collision_bucket) // Aghast, we actually link into collision space!
             {
+                Bucket* collision_buck = buck->next_collision_bucket;
                 /*
                 So, We could just do nothing and just declare this a deleted bucket.
                 However, deleted buckets are:
@@ -407,7 +429,8 @@ public:
                     -Confusing to code around
                 So we're just not having them. This bucket gets to be "promoted" into the main memory.
                 */
-                *buck = std::move(*buck->next_collision_bucket);
+                collision_data.known_holes.insert(collision_buck)
+                *buck = std::move(*collision_buck);
                 --used_bucket_count;
                 return;
             }
@@ -425,6 +448,7 @@ public:
             {
                 buck->next_collision_bucket = next_buck->next_collision_bucket;
                 next_buck->clear();
+                collision_data.known_holes.insert(next_buck);
                 --used_bucket_count;
                 return;
             }
