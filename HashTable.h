@@ -1,5 +1,5 @@
+#pragma once
 #include "Forward.h"
-
 /*
 A Hashtable implementation that allocates all of its memory in one contiguous block,
 without no deleted buckets.
@@ -25,7 +25,26 @@ class HashTable
 
         Bucket() = default;
         Bucket(const Bucket&) = default;
+        Bucket& operator=(Bucket& dead_buck) = default;
         Bucket(Bucket&) = default;
+
+        //FIXME: I would prefer it if Bucket's destruction was controlled by HashTable rather than implicitly happening on every bucket-destruct,
+        //since sometimes the bucket has no real data to even destruct in the first place.
+        ~Bucket()
+        {
+            clear();
+        }
+        inline void clear()
+        {
+            if(used)
+            {
+                //std::cout << "Deleting " << *key() << "\t" << value()->to_string() << "\n";
+                key()->~Key();
+                value()->~Value();
+            }
+            used = false;
+        }
+
         //Move constructor! woo!
         //This constructor assumes that this is a bucket "worth saving",
         //and so must have a key and value.
@@ -53,15 +72,6 @@ class HashTable
                 dead_buck.used = false;
             }
             return *this;
-        }
-        void clear()
-        {
-            if(used)
-            {
-                key()->~Key();
-                value()->~Value();
-            }
-            used = false;
         }
     };
 
@@ -102,6 +112,10 @@ class HashTable
             return !(this->operator==(other));
         }
         Iterator operator++(int)
+        {
+            return this->operator++();
+        }
+        Iterator& operator++()
         {
             if(next_bucket) // Try going deeper in the linked list
             {
@@ -175,6 +189,12 @@ class HashTable
         {
 
         }
+
+        //Dummy construct. Use wisely.
+        CollisionData(bool)
+        {
+
+        }
         Bucket* allocate_collision_bucket()
         {
             if(!known_holes.empty())
@@ -201,12 +221,7 @@ class HashTable
             return nullptr;
         }
     } collision_data;
-    Bucket* collision_block_begin; 
-    size_t collision_capacity;
-    std::hash<Key> hasher;
-
-
-    
+    [[no_unique_address]] std::hash<Key> hasher;
 
     //FIXME: It's somewhat problematic that we iterate over *all* old buckets during a rehash.
     void rehash(size_t new_capacity)
@@ -226,7 +241,7 @@ class HashTable
             Bucket& new_buck = new_block[new_index];
             if(!new_buck.used)
             {
-                new_buck = std::move(old_buck);
+                new (&new_buck) Bucket(std::move(old_buck));
                 continue;
             }
             Bucket* shit = new_collision_data.allocate_collision_bucket();
@@ -236,7 +251,7 @@ class HashTable
                 rehash(new_capacity * 2);
                 return;
             }
-            *shit = std::move(old_buck);
+            new (shit) Bucket(std::move(old_buck));
         }
         delete[] bucket_block;
         bucket_block = new_block;
@@ -247,7 +262,7 @@ class HashTable
     //Takes in a key and returns its associated bucket.
     //Generic version of at() for internal use.
     //Returns nullptr if none found.
-    Bucket* at_bucket(const Key& key)
+    Bucket* at_bucket(const Key& key) const
     {
         size_t index = hasher(key) % main_capacity;
         Bucket* buck = bucket_block + index;
@@ -271,9 +286,11 @@ class HashTable
 public:
     //Basic helpers
     [[nodiscard]] size_t capacity() const { return total_capacity;}
+    [[nodiscard]] size_t bucket_count() const { return total_capacity;}
+    [[nodiscard]] constexpr float max_load_factor() const { return 1.0;}
     [[nodiscard]] size_t size() const { return used_bucket_count;}
-    bool contains(const Key& key) const { return at_bucket(key) != nullptr;}
-    size_t count(const Key& key) const { return contains(key);}
+    [[nodiscard]] bool contains(const Key& key) const { return at_bucket(key) != nullptr;}
+    [[nodiscard]] size_t count(const Key& key) const { return contains(key);}
 
     //Capacity & memory API
     inline void clear() { *this = HashTable();}
@@ -299,7 +316,7 @@ public:
         for(size_t i = 0; i < total_capacity; ++i)
         {
             Bucket& buck = bucket_block[i];
-            if(&buck == collision_block_begin)
+            if(&buck == collision_data.begin)
             {
                 std::cout << "There's more.\n"; // No!!
                 unprinted_collision_ptr = false;
@@ -316,7 +333,7 @@ public:
         {
             std::cout << "Dangling collision_block_begin pointer!\n";
             std::cout << std::to_string(reinterpret_cast<size_t>(bucket_block)) << std::endl;
-            std::cout << std::to_string(collision_block_begin - bucket_block) << std::endl;
+            std::cout << std::to_string(collision_data.begin - bucket_block) << std::endl;
         }
     }
     size_t hash_collisions = 0;
@@ -331,22 +348,75 @@ public:
     {
 
     }
-    ~HashTable()
+    HashTable(std::initializer_list<std::pair<Key,Value>> list)
+    :bucket_block(nullptr)
+    ,total_capacity(0)
+    ,main_capacity(0)
+    ,used_bucket_count(0)
+    ,collision_data(false)
     {
+        rehash(list.size()); // FIXME: This is weird.
+        for(auto& ptr : list)
+        {
+            insert(ptr);
+        }
+    }
+
+    HashTable(const HashTable& other)
+    :bucket_block(new Bucket[other.total_capacity])
+    ,total_capacity(other.total_capacity)
+    ,main_capacity(other.main_capacity)
+    ,used_bucket_count(other.used_bucket_count)
+    ,collision_data(other.collision_data)
+    {
+        //So, there's a lot of Bucket* data in the current implementation.
+        //We're going to have to... awkwardly move all that around. :/
+        ptrdiff_t offset = bucket_block - other.bucket_block;
         for(size_t i = 0; i < total_capacity; ++i)
         {
-            Bucket& buck = bucket_block[i];
-            if(buck.used)
+            Bucket& other_buck = other.bucket_block[i];
+            if(other_buck.used)
             {
-                buck.key()->~Key();
-                buck.value()->~Value();
+                Bucket& buck = bucket_block[i];
+                buck.used = true;
+                new (buck.key()) Key(*other_buck.key());
+                new (buck.value()) Value(*other_buck.value()); 
+                if(other_buck.next_collision_bucket)
+                    buck.next_collision_bucket = other_buck.next_collision_bucket + offset;
             }
         }
+        collision_data.begin += offset;
+        collision_data.known_holes = {}; //FIXME.
+    }
+    HashTable& operator=(const HashTable& other)
+    {
+        //So, there's a lot of Bucket* data in the current implementation.
+        //We're going to have to... awkwardly move all that around. :/
+        ptrdiff_t offset = bucket_block - other.bucket_block;
+        for(size_t i = 0; i < total_capacity; ++i)
+        {
+            Bucket& other_buck = other.bucket_block[i];
+            if(other_buck.used)
+            {
+                Bucket& buck = bucket_block[i];
+                buck.used = true;
+                new (buck.key()) Key(*other_buck.key());
+                new (buck.value()) Value(*other_buck.value()); 
+                if(other_buck.next_collision_bucket)
+                    buck.next_collision_bucket = other_buck.next_collision_bucket + offset;
+            }
+        }
+        collision_data.begin += offset;
+        collision_data.known_holes = {}; //FIXME.
+        return *this;
+    }
+    ~HashTable()
+    {
         delete[] bucket_block;
     }
 
     //throwing
-    Value& at(const Key& key)
+    Value& at(const Key& key) const
     {
         Bucket* buck = at_bucket(key);
         if(!buck)
@@ -355,14 +425,16 @@ public:
     }
 
     //non-throwing; will default-construct a Value into a novel bucket if this key doesn't exist
-    Value& operator[](const Key& key) noexcept
+    Value& operator[](const Key& key)
     {
         size_t index = hasher(key) % main_capacity;
         Bucket* buck = bucket_block + index;
         Bucket* fav_buck = nullptr; // the bucket we'll construct into if we confirm that nothing can be found
         if(buck->used)
         {
+#ifdef DEBUG
             hash_collisions++;
+#endif
             if(*buck->key() == key)
             {
                 return *buck->value();
@@ -402,10 +474,15 @@ public:
             fav_buck = buck;
             
         }
-        //ASSERT(fav_buck != nullptr);
+#ifdef DEBUG
+        if(fav_buck < bucket_block || fav_buck >= bucket_block + total_capacity) [[unlikely]]
+        {
+            throw std::out_of_range("Bucket found for assignment was out of scope!");
+        }
+#endif
         ++used_bucket_count;
         fav_buck->used = true;
-        *fav_buck->key() = std::move(key);
+        new (fav_buck->key()) Key(key);
         new (fav_buck->value()) Value();
         return *fav_buck->value();
     }
@@ -429,7 +506,7 @@ public:
                     -Confusing to code around
                 So we're just not having them. This bucket gets to be "promoted" into the main memory.
                 */
-                collision_data.known_holes.insert(collision_buck)
+                collision_data.known_holes.push(collision_buck);
                 *buck = std::move(*collision_buck);
                 --used_bucket_count;
                 return;
@@ -448,12 +525,25 @@ public:
             {
                 buck->next_collision_bucket = next_buck->next_collision_bucket;
                 next_buck->clear();
-                collision_data.known_holes.insert(next_buck);
+                collision_data.known_holes.push(next_buck);
                 --used_bucket_count;
                 return;
             }
             next_buck = buck->next_collision_bucket;
         }
         return;
+    }
+    inline void erase(const Key& key) { return remove(key);}
+
+    void insert(Iterator begin, const Iterator& end)
+    {
+        for(;begin != end; ++begin)
+        {
+            this->operator[](begin.key()) = begin.value();
+        }
+    }
+    void insert(const std::pair<Key,Value>& pair)
+    {
+        this->operator[](pair.first) = pair.second; // FIXME: Implement an insert variant that skips over the unnecessary default-construct that operator[] does.
     }
 };
